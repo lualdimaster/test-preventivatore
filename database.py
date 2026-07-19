@@ -308,7 +308,7 @@ class Database:
         q += " ORDER BY ordine"
         return [dict(r) for r in c.execute(q).fetchall()]
 
-    def upsert_categoria(self, d: dict):
+    def upsert_categoria(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('cat')
         c = self._conn()
@@ -321,7 +321,8 @@ class Database:
                 sconto_rivenditore=excluded.sconto_rivenditore
         """, (d['id'], d['nome'], d.get('colore', '#888888'), d.get('ordine', 0),
               d.get('attivo', 1), d.get('sconto_rivenditore', 0)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_categoria(self, id: str):
@@ -343,7 +344,7 @@ class Database:
         q = f"SELECT * FROM materiali WHERE {' AND '.join(conds)} ORDER BY ordine"
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
-    def upsert_materiale(self, d: dict):
+    def upsert_materiale(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('mat')
         c = self._conn()
@@ -354,7 +355,8 @@ class Database:
                 nome=excluded.nome, cat_id=excluded.cat_id,
                 ordine=excluded.ordine, attivo=excluded.attivo
         """, (d['id'], d['nome'], d.get('cat_id'), d.get('ordine', 0), d.get('attivo', 1)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_materiale(self, id: str):
@@ -376,7 +378,7 @@ class Database:
         q = f"SELECT * FROM colori WHERE {' AND '.join(conds)} ORDER BY ordine"
         return [dict(r) for r in c.execute(q, params).fetchall()]
 
-    def upsert_colore(self, d: dict):
+    def upsert_colore(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('col')
         c = self._conn()
@@ -388,7 +390,8 @@ class Database:
                 mat_id=excluded.mat_id, ordine=excluded.ordine, attivo=excluded.attivo
         """, (d['id'], d['nome'], d.get('codice', '#cccccc'), d.get('mat_id'),
               d.get('ordine', 0), d.get('attivo', 1)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_colore(self, id: str):
@@ -416,7 +419,7 @@ class Database:
         r = c.execute("SELECT * FROM prodotti WHERE id=?", (id,)).fetchone()
         return self._parse_prodotto(dict(r)) if r else None
 
-    def upsert_prodotto(self, d: dict):
+    def upsert_prodotto(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('pr')
         c = self._conn()
@@ -442,7 +445,8 @@ class Database:
             self._serialize_lista(d.get('finitura_ids')), self._serialize_lista(d.get('optional_ids')),
             d.get('supporta_stampa', 1), d.get('supporta_cnc', 0), d.get('attivo', 1),
         ))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_prodotto(self, id: str):
@@ -460,7 +464,7 @@ class Database:
             q += " WHERE attivo=1"
         return [dict(r) for r in c.execute(q).fetchall()]
 
-    def upsert_stampa(self, d: dict):
+    def upsert_stampa(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('stampa')
         c = self._conn()
@@ -473,7 +477,8 @@ class Database:
                 noprint=excluded.noprint, attivo=excluded.attivo
         """, (d['id'], d['nome'], d.get('descrizione', ''), d.get('add_mq_pub', 0),
               d.get('add_mq_rev', 0), d.get('noprint', 0), d.get('attivo', 1)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_stampa(self, id: str):
@@ -491,7 +496,7 @@ class Database:
             q += " WHERE attivo=1"
         return [dict(r) for r in c.execute(q).fetchall()]
 
-    def upsert_stampa_bianco(self, d: dict):
+    def upsert_stampa_bianco(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('bianco')
         c = self._conn()
@@ -504,7 +509,8 @@ class Database:
                 attivo=excluded.attivo
         """, (d['id'], d['nome'], d.get('descrizione', ''), d.get('add_mq_pub', 0),
               d.get('add_mq_rev', 0), d.get('attivo', 1)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_stampa_bianco(self, id: str):
@@ -522,7 +528,7 @@ class Database:
             q += " WHERE attivo=1"
         return [dict(r) for r in c.execute(q).fetchall()]
 
-    def upsert_tipologia_stampa(self, d: dict):
+    def upsert_tipologia_stampa(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('tipologia')
         c = self._conn()
@@ -535,7 +541,8 @@ class Database:
                 attivo=excluded.attivo
         """, (d['id'], d['nome'], d.get('descrizione', ''), d.get('add_mq_pub', 0),
               d.get('add_mq_rev', 0), d.get('attivo', 1)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_tipologia_stampa(self, id: str):
@@ -557,7 +564,7 @@ class Database:
         ).fetchone()
         return dict(r) if r else None
 
-    def upsert_rivenditore(self, d: dict):
+    def upsert_rivenditore(self, d: dict, _commit=True):
         if not d.get('id'):
             d['id'] = self._new_id('r')
         c = self._conn()
@@ -567,7 +574,8 @@ class Database:
             ON CONFLICT(id) DO UPDATE SET
                 nome=excluded.nome, pin=excluded.pin, attivo=excluded.attivo
         """, (d['id'], d['nome'], str(d.get('pin', '')), d.get('attivo', 1)))
-        c.commit()
+        if _commit:
+            c.commit()
         return d['id']
 
     def delete_rivenditore(self, id: str):
@@ -644,7 +652,14 @@ class Database:
 
     def import_json(self, data: dict):
         """Importa dati dal formato JSON (export_json, o il vecchio formato del
-        configuratore HTML). Restituisce (n_importati, errori)."""
+        configuratore HTML). Restituisce (n_importati, errori).
+
+        IMPORTANTE per le prestazioni con Turso: tutte le scritture di questo
+        metodo condividono UN SOLO commit finale, invece di uno per elemento
+        (upsert_*(..., _commit=False)). Con un'importazione di ~70 elementi,
+        un commit a testa significa ~70 giri di rete uno dietro l'altro verso
+        Turso — lentissimo, ed è lo stesso problema già diagnosticato e
+        risolto nel gestionale magazzino durante le importazioni massive."""
         n, errori = 0, []
 
         def safe(fn, label):
@@ -662,7 +677,7 @@ class Database:
                 'ordine': x.get('ordine', 0),
                 'attivo': 1 if x.get('attivo', True) else 0,
                 'sconto_rivenditore': x.get('scontoRivenditore', x.get('sconto_rivenditore', 0)),
-            }), f"Categoria {x.get('nome')}")
+            }, _commit=False), f"Categoria {x.get('nome')}")
 
         for x in data.get('materiali', []):
             safe(lambda x=x: self.upsert_materiale({
@@ -670,7 +685,7 @@ class Database:
                 'cat_id': x.get('cat', x.get('cat_id', '')),
                 'ordine': x.get('ordine', 0),
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Materiale {x.get('nome')}")
+            }, _commit=False), f"Materiale {x.get('nome')}")
 
         for x in data.get('colori', []):
             safe(lambda x=x: self.upsert_colore({
@@ -679,7 +694,7 @@ class Database:
                 'mat_id': x.get('mat', x.get('mat_id', '')),
                 'ordine': x.get('ordine', 0),
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Colore {x.get('nome')}")
+            }, _commit=False), f"Colore {x.get('nome')}")
 
         for x in data.get('prodotti', []):
             safe(lambda x=x: self.upsert_prodotto({
@@ -696,7 +711,7 @@ class Database:
                 'supporta_stampa': 1 if x.get('supportaStampa', True) else 0,
                 'supporta_cnc': 1 if x.get('supportaCNC', False) else 0,
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Prodotto {x.get('spessore')}")
+            }, _commit=False), f"Prodotto {x.get('spessore')}")
 
         for x in data.get('stampa', []):
             safe(lambda x=x: self.upsert_stampa({
@@ -706,7 +721,7 @@ class Database:
                 'add_mq_rev': x.get('addMqRev', x.get('add_mq_rev', 0)),
                 'noprint': 1 if x.get('noprint', False) else 0,
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Stampa {x.get('nome')}")
+            }, _commit=False), f"Stampa {x.get('nome')}")
 
         for x in data.get('stampaBianco', []):
             safe(lambda x=x: self.upsert_stampa_bianco({
@@ -715,7 +730,7 @@ class Database:
                 'add_mq_pub': x.get('addMqPub', x.get('add_mq_pub', 0)),
                 'add_mq_rev': x.get('addMqRev', x.get('add_mq_rev', 0)),
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Bianco {x.get('nome')}")
+            }, _commit=False), f"Bianco {x.get('nome')}")
 
         for x in data.get('tipologiaStampa', []):
             safe(lambda x=x: self.upsert_tipologia_stampa({
@@ -724,13 +739,14 @@ class Database:
                 'add_mq_pub': x.get('addMqPub', x.get('add_mq_pub', 0)),
                 'add_mq_rev': x.get('addMqRev', x.get('add_mq_rev', 0)),
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Tipologia {x.get('nome')}")
+            }, _commit=False), f"Tipologia {x.get('nome')}")
 
         for x in data.get('rivenditori', []):
             safe(lambda x=x: self.upsert_rivenditore({
                 'id': x['id'], 'nome': x['nome'],
                 'pin': str(x.get('pin', '')),
                 'attivo': 1 if x.get('attivo', True) else 0,
-            }), f"Rivenditore {x.get('nome')}")
+            }, _commit=False), f"Rivenditore {x.get('nome')}")
 
+        self._conn().commit()
         return n, errori
