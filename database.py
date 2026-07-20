@@ -279,6 +279,72 @@ class Database:
                 utente TEXT DEFAULT 'admin'
             )
         """)
+
+        # ── CNC / lavorazioni di taglio ──────────────────────────────────────
+        # tipo_prezzo: 'fisso' (una tantum) oppure 'mq' (moltiplicato per l'area)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS cnc (
+                id TEXT PRIMARY KEY,
+                nome TEXT NOT NULL,
+                descrizione TEXT DEFAULT '',
+                tipo_prezzo TEXT NOT NULL DEFAULT 'fisso' CHECK(tipo_prezzo IN ('fisso', 'mq')),
+                prezzo_fisso_pub REAL DEFAULT 0,
+                prezzo_fisso_rev REAL DEFAULT 0,
+                prezzo_mq_pub REAL DEFAULT 0,
+                prezzo_mq_rev REAL DEFAULT 0,
+                attivo INTEGER DEFAULT 1
+            )
+        """)
+
+        # ── Finiture superficiali ─────────────────────────────────────────────
+        # Prezzo sempre in percentuale, applicata sul subtotale (materiale + stampa + CNC).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS finiture (
+                id TEXT PRIMARY KEY,
+                nome TEXT NOT NULL,
+                descrizione TEXT DEFAULT '',
+                valore_pub REAL DEFAULT 0,
+                valore_rev REAL DEFAULT 0,
+                attivo INTEGER DEFAULT 1
+            )
+        """)
+
+        # ── Optional e accessori ─────────────────────────────────────────────
+        # tipo_prezzo: 'fisso' (una tantum), 'mq' (per area) o 'ml' (per perimetro,
+        # es. occhielli/velcro applicati lungo il bordo del pannello).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS optional (
+                id TEXT PRIMARY KEY,
+                nome TEXT NOT NULL,
+                descrizione TEXT DEFAULT '',
+                tipo_prezzo TEXT NOT NULL DEFAULT 'fisso' CHECK(tipo_prezzo IN ('fisso', 'mq', 'ml')),
+                valore_pub REAL DEFAULT 0,
+                valore_rev REAL DEFAULT 0,
+                attivo INTEGER DEFAULT 1
+            )
+        """)
+
+        # ── Impostazioni globali (IVA, minimi d'ordine, contatti di consegna) ──
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS impostazioni_globali (
+                chiave TEXT PRIMARY KEY,
+                valore TEXT
+            )
+        """)
+        c.commit()
+
+        # Valori di default per le impostazioni globali, solo se non già presenti
+        # (INSERT OR IGNORE: non sovrascrive mai un valore già impostato dall'utente).
+        defaults_globali = [
+            ('iva', '22'),
+            ('minimo_lavorazione_pub', '0'),
+            ('minimo_lavorazione_rev', '0'),
+            ('consegna_testo', '3–5 giorni lavorativi'),
+            ('consegna_email', ''),
+            ('consegna_whatsapp', ''),
+        ]
+        for chiave, valore in defaults_globali:
+            c.execute("INSERT OR IGNORE INTO impostazioni_globali (chiave, valore) VALUES (?, ?)", (chiave, valore))
         c.commit()
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -551,6 +617,124 @@ class Database:
         c.commit()
 
     # ══════════════════════════════════════════════
+    # CNC / LAVORAZIONI DI TAGLIO
+    # ══════════════════════════════════════════════
+    def get_cnc(self, solo_attivi=True) -> list:
+        c = self._conn()
+        q = "SELECT * FROM cnc"
+        if solo_attivi:
+            q += " WHERE attivo=1"
+        return [dict(r) for r in c.execute(q).fetchall()]
+
+    def upsert_cnc(self, d: dict, _commit=True):
+        if not d.get('id'):
+            d['id'] = self._new_id('cnc')
+        c = self._conn()
+        c.execute("""
+            INSERT INTO cnc (id,nome,descrizione,tipo_prezzo,prezzo_fisso_pub,prezzo_fisso_rev,
+                              prezzo_mq_pub,prezzo_mq_rev,attivo)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                nome=excluded.nome, descrizione=excluded.descrizione, tipo_prezzo=excluded.tipo_prezzo,
+                prezzo_fisso_pub=excluded.prezzo_fisso_pub, prezzo_fisso_rev=excluded.prezzo_fisso_rev,
+                prezzo_mq_pub=excluded.prezzo_mq_pub, prezzo_mq_rev=excluded.prezzo_mq_rev,
+                attivo=excluded.attivo
+        """, (d['id'], d['nome'], d.get('descrizione', ''), d.get('tipo_prezzo', 'fisso'),
+              d.get('prezzo_fisso_pub', 0), d.get('prezzo_fisso_rev', 0),
+              d.get('prezzo_mq_pub', 0), d.get('prezzo_mq_rev', 0), d.get('attivo', 1)))
+        if _commit:
+            c.commit()
+        return d['id']
+
+    def delete_cnc(self, id: str):
+        c = self._conn()
+        c.execute("DELETE FROM cnc WHERE id=?", (id,))
+        c.commit()
+
+    # ══════════════════════════════════════════════
+    # FINITURE SUPERFICIALI
+    # ══════════════════════════════════════════════
+    def get_finiture(self, solo_attivi=True) -> list:
+        c = self._conn()
+        q = "SELECT * FROM finiture"
+        if solo_attivi:
+            q += " WHERE attivo=1"
+        return [dict(r) for r in c.execute(q).fetchall()]
+
+    def upsert_finitura(self, d: dict, _commit=True):
+        if not d.get('id'):
+            d['id'] = self._new_id('fin')
+        c = self._conn()
+        c.execute("""
+            INSERT INTO finiture (id,nome,descrizione,valore_pub,valore_rev,attivo)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                nome=excluded.nome, descrizione=excluded.descrizione,
+                valore_pub=excluded.valore_pub, valore_rev=excluded.valore_rev, attivo=excluded.attivo
+        """, (d['id'], d['nome'], d.get('descrizione', ''), d.get('valore_pub', 0),
+              d.get('valore_rev', 0), d.get('attivo', 1)))
+        if _commit:
+            c.commit()
+        return d['id']
+
+    def delete_finitura(self, id: str):
+        c = self._conn()
+        c.execute("DELETE FROM finiture WHERE id=?", (id,))
+        c.commit()
+
+    # ══════════════════════════════════════════════
+    # OPTIONAL E ACCESSORI
+    # ══════════════════════════════════════════════
+    def get_optional(self, solo_attivi=True) -> list:
+        c = self._conn()
+        q = "SELECT * FROM optional"
+        if solo_attivi:
+            q += " WHERE attivo=1"
+        return [dict(r) for r in c.execute(q).fetchall()]
+
+    def upsert_optional(self, d: dict, _commit=True):
+        if not d.get('id'):
+            d['id'] = self._new_id('opt')
+        c = self._conn()
+        c.execute("""
+            INSERT INTO optional (id,nome,descrizione,tipo_prezzo,valore_pub,valore_rev,attivo)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                nome=excluded.nome, descrizione=excluded.descrizione, tipo_prezzo=excluded.tipo_prezzo,
+                valore_pub=excluded.valore_pub, valore_rev=excluded.valore_rev, attivo=excluded.attivo
+        """, (d['id'], d['nome'], d.get('descrizione', ''), d.get('tipo_prezzo', 'fisso'),
+              d.get('valore_pub', 0), d.get('valore_rev', 0), d.get('attivo', 1)))
+        if _commit:
+            c.commit()
+        return d['id']
+
+    def delete_optional(self, id: str):
+        c = self._conn()
+        c.execute("DELETE FROM optional WHERE id=?", (id,))
+        c.commit()
+
+    # ══════════════════════════════════════════════
+    # IMPOSTAZIONI GLOBALI (IVA, minimi, contatti di consegna)
+    # ══════════════════════════════════════════════
+    def get_impostazione_globale(self, chiave: str, default=None):
+        c = self._conn()
+        r = c.execute("SELECT valore FROM impostazioni_globali WHERE chiave=?", (chiave,)).fetchone()
+        return r["valore"] if r else default
+
+    def get_impostazioni_globali(self) -> dict:
+        c = self._conn()
+        rows = c.execute("SELECT chiave, valore FROM impostazioni_globali").fetchall()
+        return {r["chiave"]: r["valore"] for r in rows}
+
+    def set_impostazione_globale(self, chiave: str, valore):
+        c = self._conn()
+        c.execute("""
+            INSERT INTO impostazioni_globali (chiave, valore) VALUES (?, ?)
+            ON CONFLICT(chiave) DO UPDATE SET valore=excluded.valore
+        """, (chiave, str(valore)))
+        c.commit()
+
+    # ══════════════════════════════════════════════
     # RIVENDITORI
     # ══════════════════════════════════════════════
     def get_rivenditori(self) -> list:
@@ -647,7 +831,11 @@ class Database:
             'stampa': self.get_stampa(solo_attiva=False),
             'stampaBianco': self.get_stampa_bianco(solo_attiva=False),
             'tipologiaStampa': self.get_tipologia_stampa(solo_attiva=False),
+            'cnc': self.get_cnc(solo_attivi=False),
+            'finiture': self.get_finiture(solo_attivi=False),
+            'optional': self.get_optional(solo_attivi=False),
             'rivenditori': self.get_rivenditori(),
+            'impostazioniGlobali': self.get_impostazioni_globali(),
         }
 
     def import_json(self, data: dict):
@@ -747,6 +935,41 @@ class Database:
                 'pin': str(x.get('pin', '')),
                 'attivo': 1 if x.get('attivo', True) else 0,
             }, _commit=False), f"Rivenditore {x.get('nome')}")
+
+        for x in data.get('cnc', []):
+            safe(lambda x=x: self.upsert_cnc({
+                'id': x['id'], 'nome': x['nome'],
+                'descrizione': x.get('desc', x.get('descrizione', '')),
+                'tipo_prezzo': x.get('tipoPrezzo', x.get('tipo_prezzo', 'fisso')),
+                'prezzo_fisso_pub': x.get('prezzoFissoPub', x.get('prezzo_fisso_pub', 0)),
+                'prezzo_fisso_rev': x.get('prezzoFissoRev', x.get('prezzo_fisso_rev', 0)),
+                'prezzo_mq_pub': x.get('prezzoMqPub', x.get('prezzo_mq_pub', 0)),
+                'prezzo_mq_rev': x.get('prezzoMqRev', x.get('prezzo_mq_rev', 0)),
+                'attivo': 1 if x.get('attivo', True) else 0,
+            }, _commit=False), f"CNC {x.get('nome')}")
+
+        for x in data.get('finiture', []):
+            safe(lambda x=x: self.upsert_finitura({
+                'id': x['id'], 'nome': x['nome'],
+                'descrizione': x.get('desc', x.get('descrizione', '')),
+                'valore_pub': x.get('valorePub', x.get('valore_pub', 0)),
+                'valore_rev': x.get('valoreRev', x.get('valore_rev', 0)),
+                'attivo': 1 if x.get('attivo', True) else 0,
+            }, _commit=False), f"Finitura {x.get('nome')}")
+
+        for x in data.get('optional', []):
+            safe(lambda x=x: self.upsert_optional({
+                'id': x['id'], 'nome': x['nome'],
+                'descrizione': x.get('desc', x.get('descrizione', '')),
+                'tipo_prezzo': x.get('tipoPrezzo', x.get('tipo_prezzo', 'fisso')),
+                'valore_pub': x.get('valorePub', x.get('valore_pub', 0)),
+                'valore_rev': x.get('valoreRev', x.get('valore_rev', 0)),
+                'attivo': 1 if x.get('attivo', True) else 0,
+            }, _commit=False), f"Optional {x.get('nome')}")
+
+        for chiave, valore in data.get('impostazioniGlobali', {}).items():
+            safe(lambda chiave=chiave, valore=valore: self.set_impostazione_globale(chiave, valore),
+                 f"Impostazione {chiave}")
 
         self._conn().commit()
         return n, errori

@@ -106,6 +106,9 @@ def init_session():
         'cfg_stampa_id': None,
         'cfg_bianco_id': None,
         'cfg_tipologia_id': None,
+        'cfg_cnc_ids': [],
+        'cfg_finitura_ids': [],
+        'cfg_optional_ids': [],
         'cfg_larghezza': 100.0,
         'cfg_altezza': 70.0,
         'cfg_qty': 1,
@@ -129,16 +132,99 @@ def cfg_reset():
     for k in ['cfg_cat_id', 'cfg_mat_id', 'cfg_col_id', 'cfg_prod',
               'cfg_stampa_id', 'cfg_bianco_id', 'cfg_tipologia_id']:
         st.session_state[k] = None
+    st.session_state.cfg_cnc_ids = []
+    st.session_state.cfg_finitura_ids = []
+    st.session_state.cfg_optional_ids = []
     st.session_state.cfg_step = 1
     st.session_state.cfg_larghezza = 100.0
     st.session_state.cfg_altezza = 70.0
     st.session_state.cfg_qty = 1
+
+
+# ── Pipeline degli step del wizard ──────────────────────────────────────────
+# Elenco fisso nel codice (non riordinabile da Admin, per ora — vedi
+# REGISTRO_ATTIVITA per la discussione su questa scelta), ma organizzato come
+# "elenco di passi con funzione dedicata": pronto ad accogliere in futuro,
+# con un intervento contenuto, una versione configurabile da Admin senza
+# dover riscrivere il wizard da capo.
+PASSI_FISSI_INIZIALI = ['categoria', 'materiale', 'colore', 'spessore']
+PASSI_OPZIONALI = ['stampa', 'bianco', 'tipologia', 'cnc', 'finitura', 'optional']
+PASSI_FISSI_FINALI = ['dimensioni', 'quantita']
+
+PASSI_LABEL = {
+    'categoria': 'Categoria', 'materiale': 'Materiale', 'colore': 'Colore',
+    'spessore': 'Spessore', 'stampa': 'Stampa', 'bianco': 'Bianco',
+    'tipologia': 'Tipologia', 'cnc': 'CNC/Taglio', 'finitura': 'Finitura',
+    'optional': 'Optional', 'dimensioni': 'Dimensioni', 'quantita': 'Quantità',
+}
+
+
+def passi_dopo_prodotto(prod) -> list:
+    """Quali step opzionali mostrare per il prodotto scelto, in base a cosa
+    ha davvero disponibile (stesso criterio già in uso per 'stampa': se la
+    lista di opzioni collegate è vuota, lo step si salta automaticamente)."""
+    if not prod:
+        return list(PASSI_FISSI_FINALI)
+    disponibili = []
+    if prod.get('supporta_stampa') and prod.get('stampa_ids'):
+        disponibili.append('stampa')
+        # bianco e tipologia hanno senso solo se si stampa
+        if prod.get('bianco_ids'):
+            disponibili.append('bianco')
+        if prod.get('tipologia_ids'):
+            disponibili.append('tipologia')
+    if prod.get('supporta_cnc') and prod.get('cnc_ids'):
+        disponibili.append('cnc')
+    if prod.get('finitura_ids'):
+        disponibili.append('finitura')
+    if prod.get('optional_ids'):
+        disponibili.append('optional')
+    return disponibili + list(PASSI_FISSI_FINALI)
+
+
+def pipeline_corrente() -> list:
+    """Lista completa e ordinata delle chiavi-step per la navigazione attuale."""
+    prod = st.session_state.cfg_prod
+    return PASSI_FISSI_INIZIALI + passi_dopo_prodotto(prod)
+
+
+def step_key_corrente() -> str:
+    passi = pipeline_corrente()
+    idx = max(0, min(st.session_state.cfg_step - 1, len(passi) - 1))
+    return passi[idx]
+
+
+def vai_a_step(chiave: str):
+    passi = pipeline_corrente()
+    if chiave in passi:
+        st.session_state.cfg_step = passi.index(chiave) + 1
+    st.rerun()
+
+
+def step_successivo():
+    passi = pipeline_corrente()
+    st.session_state.cfg_step = min(st.session_state.cfg_step + 1, len(passi))
+    st.rerun()
+
+
+def step_precedente():
+    st.session_state.cfg_step = max(st.session_state.cfg_step - 1, 1)
+    st.rerun()
 
 def get_nome(lista: list, id: str, campo: str = 'nome') -> str:
     item = next((x for x in lista if x.get('id') == id), None)
     return item[campo] if item else id or '—'
 
 def calcola_prezzo_dati() -> dict | None:
+    """Calcola il prezzo del pezzo configurato.
+
+    Ordine di composizione (deciso insieme all'utente):
+    1. Materiale + Stampa + Bianco + Tipologia → prezzo/mq di base
+    2. + CNC (fisso o al mq) → subtotale "lavorato"
+    3. + Finitura (percentuale sul subtotale lavorato)
+    4. + Optional (fisso, al mq, o al metro lineare di perimetro) — aggiunti
+       DOPO la finitura, non sono superficie lavorata ma accessori a parte.
+    """
     prod = st.session_state.cfg_prod
     if not prod:
         return None
@@ -163,12 +249,70 @@ def calcola_prezzo_dati() -> dict | None:
     larg_m = st.session_state.cfg_larghezza / 100
     alt_m  = st.session_state.cfg_altezza  / 100
     sup_mq = larg_m * alt_m
-    prezzo_pezzo = prezzo_mq * sup_mq
+    perimetro_m = 2 * (larg_m + alt_m)
+
+    subtotale_base = prezzo_mq * sup_mq
+
+    # ── CNC (selezione multipla, prezzo fisso o al mq) ──────────────────────
+    dettaglio_cnc = []
+    costo_cnc = 0.0
+    for cnc_id in st.session_state.cfg_cnc_ids:
+        c = next((x for x in db.get_cnc() if x['id'] == cnc_id), None)
+        if not c:
+            continue
+        if c['tipo_prezzo'] == 'mq':
+            val = (c['prezzo_mq_rev'] if is_rev else c['prezzo_mq_pub']) * sup_mq
+        else:
+            val = c['prezzo_fisso_rev'] if is_rev else c['prezzo_fisso_pub']
+        costo_cnc += val
+        dettaglio_cnc.append({'nome': c['nome'], 'valore': val})
+
+    subtotale_lavorato = subtotale_base + costo_cnc
+
+    # ── Finitura (selezione multipla, percentuale sul subtotale lavorato) ──
+    dettaglio_finitura = []
+    costo_finitura = 0.0
+    for fin_id in st.session_state.cfg_finitura_ids:
+        f = next((x for x in db.get_finiture() if x['id'] == fin_id), None)
+        if not f:
+            continue
+        perc = f['valore_rev'] if is_rev else f['valore_pub']
+        val = subtotale_lavorato * (perc / 100)
+        costo_finitura += val
+        dettaglio_finitura.append({'nome': f['nome'], 'valore': val, 'percentuale': perc})
+
+    subtotale_con_finitura = subtotale_lavorato + costo_finitura
+
+    # ── Optional (selezione multipla, fisso / mq / ml sul perimetro) ───────
+    dettaglio_optional = []
+    costo_optional = 0.0
+    for opt_id in st.session_state.cfg_optional_ids:
+        o = next((x for x in db.get_optional() if x['id'] == opt_id), None)
+        if not o:
+            continue
+        val_unit = o['valore_rev'] if is_rev else o['valore_pub']
+        if o['tipo_prezzo'] == 'mq':
+            val = val_unit * sup_mq
+        elif o['tipo_prezzo'] == 'ml':
+            val = val_unit * perimetro_m
+        else:
+            val = val_unit
+        costo_optional += val
+        dettaglio_optional.append({'nome': o['nome'], 'valore': val})
+
+    prezzo_pezzo = subtotale_con_finitura + costo_optional
     prezzo_tot   = prezzo_pezzo * st.session_state.cfg_qty
 
     return {
         'prezzo_mq': prezzo_mq,
         'sup_mq': sup_mq,
+        'perimetro_m': perimetro_m,
+        'costo_cnc': costo_cnc,
+        'dettaglio_cnc': dettaglio_cnc,
+        'costo_finitura': costo_finitura,
+        'dettaglio_finitura': dettaglio_finitura,
+        'costo_optional': costo_optional,
+        'dettaglio_optional': dettaglio_optional,
         'prezzo_pezzo': prezzo_pezzo,
         'prezzo_tot': prezzo_tot,
     }
@@ -234,12 +378,26 @@ def render_sidebar():
                 tipo = next((t for t in db.get_tipologia_stampa() if t['id'] == st.session_state.cfg_tipologia_id), None)
                 if tipo: st.caption(f"Tipologia: {tipo['nome']}")
 
+            if st.session_state.cfg_cnc_ids:
+                nomi = [c['nome'] for c in db.get_cnc() if c['id'] in st.session_state.cfg_cnc_ids]
+                if nomi: st.caption(f"CNC: {', '.join(nomi)}")
+
+            if st.session_state.cfg_finitura_ids:
+                nomi = [f['nome'] for f in db.get_finiture() if f['id'] in st.session_state.cfg_finitura_ids]
+                if nomi: st.caption(f"Finitura: {', '.join(nomi)}")
+
+            if st.session_state.cfg_optional_ids:
+                nomi = [o['nome'] for o in db.get_optional() if o['id'] in st.session_state.cfg_optional_ids]
+                if nomi: st.caption(f"Optional: {', '.join(nomi)}")
+
             st.caption(f"Dimensioni: {st.session_state.cfg_larghezza:.0f} × {st.session_state.cfg_altezza:.0f} cm")
             st.caption(f"Quantità: {st.session_state.cfg_qty} pz")
 
-            # ── Prezzo ──────────────────────────────
+            # ── Prezzo (sempre visibile una volta scelto un prodotto: le
+            # dimensioni hanno un valore di default sensato anche prima che
+            # l'utente le personalizzi) ──────────────
             p = calcola_prezzo_dati()
-            if p and st.session_state.cfg_step >= 8:
+            if p:
                 st.divider()
                 col_cls = "price-rev" if is_rev else "price-total"
                 st.markdown(f"""
@@ -356,6 +514,7 @@ def page_admin():
         "🎨 Colori",
         "📦 Prodotti",
         "🖨️ Stampa",
+        "🔩 Lavorazioni",
         "👥 Rivenditori",
         "💾 Import / Export",
         "📋 Storico",
@@ -368,10 +527,11 @@ def page_admin():
     with tabs[3]: admin_colori()
     with tabs[4]: admin_prodotti()
     with tabs[5]: admin_stampa()
-    with tabs[6]: admin_rivenditori()
-    with tabs[7]: admin_import_export()
-    with tabs[8]: admin_storico()
-    with tabs[9]: admin_impostazioni()
+    with tabs[6]: admin_lavorazioni()
+    with tabs[7]: admin_rivenditori()
+    with tabs[8]: admin_import_export()
+    with tabs[9]: admin_storico()
+    with tabs[10]: admin_impostazioni()
 
 
 # ─────────────────────────────────────────────
@@ -595,6 +755,9 @@ def admin_prodotti():
     all_stampa  = db.get_stampa(solo_attiva=False)
     all_bianco  = db.get_stampa_bianco(solo_attiva=False)
     all_tipol   = db.get_tipologia_stampa(solo_attiva=False)
+    all_cnc     = db.get_cnc(solo_attivi=False)
+    all_fin     = db.get_finiture(solo_attivi=False)
+    all_opt     = db.get_optional(solo_attivi=False)
 
     col_map = {c['id']: c for c in colori}
     mat_map = {m['id']: m for m in materiali}
@@ -629,6 +792,12 @@ def admin_prodotti():
     b_nomi = [b['nome'] for b in all_bianco]
     t_ids  = [t['id'] for t in all_tipol]
     t_nomi = [t['nome'] for t in all_tipol]
+    cnc_ids_all  = [c['id'] for c in all_cnc]
+    cnc_nomi_all = [c['nome'] for c in all_cnc]
+    fin_ids_all  = [f['id'] for f in all_fin]
+    fin_nomi_all = [f['nome'] for f in all_fin]
+    opt_ids_all  = [o['id'] for o in all_opt]
+    opt_nomi_all = [o['nome'] for o in all_opt]
 
     for prod in prodotti_vis:
         col_info = col_map.get(prod['colore_id'], {})
@@ -656,6 +825,22 @@ def admin_prodotti():
                 default=[t_nomi[t_ids.index(x)] for x in prod['tipologia_ids'] if x in t_ids],
                 key=f"p_t_{prod['id']}")
 
+            st.markdown("**Lavorazioni aggiuntive**")
+            n_supporta_cnc = st.checkbox("Questo prodotto supporta lavorazioni CNC", bool(prod['supporta_cnc']), key=f"p_cnc_flag_{prod['id']}")
+            c7, c8, c9 = st.columns(3)
+            n_cnc = c7.multiselect("CNC disponibili",
+                cnc_nomi_all,
+                default=[cnc_nomi_all[cnc_ids_all.index(x)] for x in prod['cnc_ids'] if x in cnc_ids_all],
+                key=f"p_cnc_{prod['id']}", disabled=not n_supporta_cnc)
+            n_fin = c8.multiselect("Finiture disponibili",
+                fin_nomi_all,
+                default=[fin_nomi_all[fin_ids_all.index(x)] for x in prod['finitura_ids'] if x in fin_ids_all],
+                key=f"p_fin_{prod['id']}")
+            n_opt = c9.multiselect("Optional disponibili",
+                opt_nomi_all,
+                default=[opt_nomi_all[opt_ids_all.index(x)] for x in prod['optional_ids'] if x in opt_ids_all],
+                key=f"p_opt_{prod['id']}")
+
             n_att = st.checkbox("Attivo", bool(prod['attivo']), key=f"p_a_{prod['id']}")
 
             col_btn1, col_btn2 = st.columns(2)
@@ -669,11 +854,11 @@ def admin_prodotti():
                     'stampa_ids': [s_ids[s_nomi.index(n)] for n in n_stampa],
                     'bianco_ids': [b_ids[b_nomi.index(n)] for n in n_bianco],
                     'tipologia_ids': [t_ids[t_nomi.index(n)] for n in n_tipol],
-                    'cnc_ids': prod['cnc_ids'],
-                    'finitura_ids': prod['finitura_ids'],
-                    'optional_ids': prod['optional_ids'],
+                    'cnc_ids': [cnc_ids_all[cnc_nomi_all.index(n)] for n in n_cnc] if n_supporta_cnc else [],
+                    'finitura_ids': [fin_ids_all[fin_nomi_all.index(n)] for n in n_fin],
+                    'optional_ids': [opt_ids_all[opt_nomi_all.index(n)] for n in n_opt],
                     'supporta_stampa': prod['supporta_stampa'],
-                    'supporta_cnc': prod['supporta_cnc'],
+                    'supporta_cnc': 1 if n_supporta_cnc else 0,
                     'attivo': 1 if n_att else 0,
                 })
                 db.log(f"Modificato prodotto: {mat_info.get('nome','?')} {col_info.get('nome','?')} {n_sp}")
@@ -698,6 +883,10 @@ def admin_prodotti():
         n_stampa = st.multiselect("Stampa disponibile", s_nomi)
         n_bianco = st.multiselect("Stampa bianco", b_nomi)
         n_tipol  = st.multiselect("Tipologia stampa", t_nomi)
+        n_supporta_cnc_new = st.checkbox("Supporta lavorazioni CNC")
+        n_cnc = st.multiselect("CNC disponibili", cnc_nomi_all)
+        n_fin = st.multiselect("Finiture disponibili", fin_nomi_all)
+        n_opt = st.multiselect("Optional disponibili", opt_nomi_all)
         if st.form_submit_button("➕ Aggiungi", type="primary"):
             if n_sp.strip() and col_lab_all:
                 col_id_sel = col_ids_all[col_lab_all.index(n_col)]
@@ -710,8 +899,10 @@ def admin_prodotti():
                     'stampa_ids': [s_ids[s_nomi.index(n)] for n in n_stampa],
                     'bianco_ids': [b_ids[b_nomi.index(n)] for n in n_bianco],
                     'tipologia_ids': [t_ids[t_nomi.index(n)] for n in n_tipol],
-                    'cnc_ids': [], 'finitura_ids': [], 'optional_ids': [],
-                    'supporta_stampa': 1, 'supporta_cnc': 0, 'attivo': 1,
+                    'cnc_ids': [cnc_ids_all[cnc_nomi_all.index(n)] for n in n_cnc] if n_supporta_cnc_new else [],
+                    'finitura_ids': [fin_ids_all[fin_nomi_all.index(n)] for n in n_fin],
+                    'optional_ids': [opt_ids_all[opt_nomi_all.index(n)] for n in n_opt],
+                    'supporta_stampa': 1, 'supporta_cnc': 1 if n_supporta_cnc_new else 0, 'attivo': 1,
                 })
                 db.log(f"Aggiunto prodotto: {n_col} {n_sp}")
                 st.success("Prodotto aggiunto!")
@@ -814,6 +1005,165 @@ def admin_stampa():
                 if nome.strip():
                     db.upsert_tipologia_stampa({'id': None, 'nome': nome.strip(), 'descrizione': desc,
                                                 'add_mq_pub': pub, 'add_mq_rev': rev, 'attivo': 1})
+                    st.success("Aggiunto!")
+                    st.rerun()
+
+
+# ─────────────────────────────────────────────
+# CNC / FINITURE / OPTIONAL
+# ─────────────────────────────────────────────
+def admin_lavorazioni():
+    st.subheader("🔩 CNC, Finiture, Optional")
+    tab1, tab2, tab3 = st.tabs(["✂️ CNC / Taglio", "✨ Finiture", "➕ Optional"])
+
+    # ── CNC ──────────────────────────────────────────────────────────────
+    with tab1:
+        st.caption("Prezzo fisso (una tantum) oppure al m² — sceglibile per ciascuna lavorazione.")
+        items = db.get_cnc(solo_attivi=False)
+        for item in items:
+            with st.expander(f"{'✅' if item['attivo'] else '⬜'} {item['nome']} — {item['tipo_prezzo']}"):
+                c1, c2 = st.columns([3, 1])
+                n_nome = c1.text_input("Nome", item['nome'], key=f"cnc_n_{item['id']}")
+                n_att  = c2.checkbox("Attivo", bool(item['attivo']), key=f"cnc_a_{item['id']}")
+                n_desc = st.text_input("Descrizione (opz.)", item.get('descrizione', ''), key=f"cnc_d_{item['id']}")
+                n_tipo = st.radio("Tipo di prezzo", ['fisso', 'mq'], horizontal=True,
+                                   index=['fisso', 'mq'].index(item['tipo_prezzo']),
+                                   format_func=lambda t: "Prezzo fisso" if t == 'fisso' else "Prezzo al m²",
+                                   key=f"cnc_tp_{item['id']}")
+                if n_tipo == 'fisso':
+                    c3, c4 = st.columns(2)
+                    n_fisso_pub = c3.number_input("Prezzo fisso Pub (€)", 0.0, 9999.0, float(item['prezzo_fisso_pub']), 0.5, key=f"cnc_fp_{item['id']}")
+                    n_fisso_rev = c4.number_input("Prezzo fisso Rev (€)", 0.0, 9999.0, float(item['prezzo_fisso_rev']), 0.5, key=f"cnc_fr_{item['id']}")
+                    n_mq_pub, n_mq_rev = item['prezzo_mq_pub'], item['prezzo_mq_rev']
+                else:
+                    c3, c4 = st.columns(2)
+                    n_mq_pub = c3.number_input("Prezzo Pub (€/m²)", 0.0, 999.0, float(item['prezzo_mq_pub']), 0.5, key=f"cnc_mp_{item['id']}")
+                    n_mq_rev = c4.number_input("Prezzo Rev (€/m²)", 0.0, 999.0, float(item['prezzo_mq_rev']), 0.5, key=f"cnc_mr_{item['id']}")
+                    n_fisso_pub, n_fisso_rev = item['prezzo_fisso_pub'], item['prezzo_fisso_rev']
+
+                col_s, col_d = st.columns(2)
+                if col_s.button("💾 Salva", key=f"cnc_sv_{item['id']}"):
+                    db.upsert_cnc({'id': item['id'], 'nome': n_nome, 'descrizione': n_desc,
+                                   'tipo_prezzo': n_tipo,
+                                   'prezzo_fisso_pub': n_fisso_pub, 'prezzo_fisso_rev': n_fisso_rev,
+                                   'prezzo_mq_pub': n_mq_pub, 'prezzo_mq_rev': n_mq_rev,
+                                   'attivo': 1 if n_att else 0})
+                    st.success("Salvato ✅")
+                    st.rerun()
+                if col_d.button("🗑️ Elimina", key=f"cnc_dl_{item['id']}"):
+                    db.delete_cnc(item['id'])
+                    st.rerun()
+
+        st.divider()
+        st.markdown("#### ➕ Nuova lavorazione CNC")
+        with st.form("nuova_cnc"):
+            nome = st.text_input("Nome", placeholder="Es. Taglio squadrato, Sagomato, Fori")
+            desc = st.text_input("Descrizione (opz.)")
+            tipo = st.radio("Tipo di prezzo", ['fisso', 'mq'], horizontal=True,
+                             format_func=lambda t: "Prezzo fisso" if t == 'fisso' else "Prezzo al m²")
+            c1, c2 = st.columns(2)
+            if tipo == 'fisso':
+                p_pub = c1.number_input("Prezzo fisso Pub (€)", 0.0, 9999.0, 0.0, 0.5)
+                p_rev = c2.number_input("Prezzo fisso Rev (€)", 0.0, 9999.0, 0.0, 0.5)
+                mq_pub, mq_rev = 0, 0
+                fisso_pub, fisso_rev = p_pub, p_rev
+            else:
+                p_pub = c1.number_input("Prezzo Pub (€/m²)", 0.0, 999.0, 0.0, 0.5)
+                p_rev = c2.number_input("Prezzo Rev (€/m²)", 0.0, 999.0, 0.0, 0.5)
+                mq_pub, mq_rev = p_pub, p_rev
+                fisso_pub, fisso_rev = 0, 0
+            if st.form_submit_button("➕ Aggiungi", type="primary"):
+                if nome.strip():
+                    db.upsert_cnc({'id': None, 'nome': nome.strip(), 'descrizione': desc,
+                                   'tipo_prezzo': tipo,
+                                   'prezzo_fisso_pub': fisso_pub, 'prezzo_fisso_rev': fisso_rev,
+                                   'prezzo_mq_pub': mq_pub, 'prezzo_mq_rev': mq_rev, 'attivo': 1})
+                    st.success("Aggiunto!")
+                    st.rerun()
+
+    # ── FINITURE ─────────────────────────────────────────────────────────
+    with tab2:
+        st.caption("Prezzo sempre in percentuale, applicata sul subtotale materiale + stampa + CNC.")
+        items = db.get_finiture(solo_attivi=False)
+        for item in items:
+            with st.expander(f"{'✅' if item['attivo'] else '⬜'} {item['nome']} — rev: +{item['valore_rev']}%"):
+                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+                n_nome = c1.text_input("Nome", item['nome'], key=f"fin_n_{item['id']}")
+                n_pub  = c2.number_input("+% Pub", 0.0, 100.0, float(item['valore_pub']), 0.5, key=f"fin_p_{item['id']}")
+                n_rev  = c3.number_input("+% Rev", 0.0, 100.0, float(item['valore_rev']), 0.5, key=f"fin_r_{item['id']}")
+                n_att  = c4.checkbox("Attivo", bool(item['attivo']), key=f"fin_a_{item['id']}")
+                n_desc = st.text_input("Descrizione (opz.)", item.get('descrizione', ''), key=f"fin_d_{item['id']}")
+
+                col_s, col_d = st.columns(2)
+                if col_s.button("💾 Salva", key=f"fin_sv_{item['id']}"):
+                    db.upsert_finitura({'id': item['id'], 'nome': n_nome, 'descrizione': n_desc,
+                                        'valore_pub': n_pub, 'valore_rev': n_rev, 'attivo': 1 if n_att else 0})
+                    st.success("Salvato ✅")
+                    st.rerun()
+                if col_d.button("🗑️ Elimina", key=f"fin_dl_{item['id']}"):
+                    db.delete_finitura(item['id'])
+                    st.rerun()
+
+        st.divider()
+        st.markdown("#### ➕ Nuova finitura")
+        with st.form("nuova_finitura"):
+            c1, c2, c3 = st.columns([3, 1, 1])
+            nome = c1.text_input("Nome", placeholder="Es. Lucido, Opaco, Antiriflesso")
+            pub  = c2.number_input("+% Pub", 0.0, 100.0, 0.0, 0.5)
+            rev  = c3.number_input("+% Rev", 0.0, 100.0, 0.0, 0.5)
+            desc = st.text_input("Descrizione (opz.)")
+            if st.form_submit_button("➕ Aggiungi", type="primary"):
+                if nome.strip():
+                    db.upsert_finitura({'id': None, 'nome': nome.strip(), 'descrizione': desc,
+                                        'valore_pub': pub, 'valore_rev': rev, 'attivo': 1})
+                    st.success("Aggiunto!")
+                    st.rerun()
+
+    # ── OPTIONAL ─────────────────────────────────────────────────────────
+    with tab3:
+        st.caption("Prezzo fisso (una tantum), al m², o al metro lineare di perimetro "
+                  "(es. occhielli, velcro applicati lungo il bordo del pannello).")
+        items = db.get_optional(solo_attivi=False)
+        unita_label = {'fisso': '€', 'mq': '€/m²', 'ml': '€/ml'}
+        for item in items:
+            with st.expander(f"{'✅' if item['attivo'] else '⬜'} {item['nome']} — {unita_label[item['tipo_prezzo']]} {item['valore_rev']}"):
+                c1, c2 = st.columns([3, 1])
+                n_nome = c1.text_input("Nome", item['nome'], key=f"opt_n_{item['id']}")
+                n_att  = c2.checkbox("Attivo", bool(item['attivo']), key=f"opt_a_{item['id']}")
+                n_desc = st.text_input("Descrizione (opz.)", item.get('descrizione', ''), key=f"opt_d_{item['id']}")
+                n_tipo = st.radio("Tipo di prezzo", ['fisso', 'mq', 'ml'], horizontal=True,
+                                   index=['fisso', 'mq', 'ml'].index(item['tipo_prezzo']),
+                                   format_func=lambda t: {'fisso': 'Prezzo fisso', 'mq': 'Al m²', 'ml': 'Al metro lineare (perimetro)'}[t],
+                                   key=f"opt_tp_{item['id']}")
+                c3, c4 = st.columns(2)
+                n_pub = c3.number_input(f"Prezzo Pub ({unita_label[n_tipo]})", 0.0, 999.0, float(item['valore_pub']), 0.5, key=f"opt_p_{item['id']}")
+                n_rev = c4.number_input(f"Prezzo Rev ({unita_label[n_tipo]})", 0.0, 999.0, float(item['valore_rev']), 0.5, key=f"opt_r_{item['id']}")
+
+                col_s, col_d = st.columns(2)
+                if col_s.button("💾 Salva", key=f"opt_sv_{item['id']}"):
+                    db.upsert_optional({'id': item['id'], 'nome': n_nome, 'descrizione': n_desc,
+                                        'tipo_prezzo': n_tipo, 'valore_pub': n_pub, 'valore_rev': n_rev,
+                                        'attivo': 1 if n_att else 0})
+                    st.success("Salvato ✅")
+                    st.rerun()
+                if col_d.button("🗑️ Elimina", key=f"opt_dl_{item['id']}"):
+                    db.delete_optional(item['id'])
+                    st.rerun()
+
+        st.divider()
+        st.markdown("#### ➕ Nuovo optional")
+        with st.form("nuovo_optional"):
+            nome = st.text_input("Nome", placeholder="Es. Occhielli, Distanziali, Imballaggio rinforzato")
+            desc = st.text_input("Descrizione (opz.)")
+            tipo = st.radio("Tipo di prezzo", ['fisso', 'mq', 'ml'], horizontal=True,
+                             format_func=lambda t: {'fisso': 'Prezzo fisso', 'mq': 'Al m²', 'ml': 'Al metro lineare (perimetro)'}[t])
+            c1, c2 = st.columns(2)
+            p_pub = c1.number_input(f"Prezzo Pub ({unita_label[tipo]})", 0.0, 999.0, 0.0, 0.5)
+            p_rev = c2.number_input(f"Prezzo Rev ({unita_label[tipo]})", 0.0, 999.0, 0.0, 0.5)
+            if st.form_submit_button("➕ Aggiungi", type="primary"):
+                if nome.strip():
+                    db.upsert_optional({'id': None, 'nome': nome.strip(), 'descrizione': desc,
+                                        'tipo_prezzo': tipo, 'valore_pub': p_pub, 'valore_rev': p_rev, 'attivo': 1})
                     st.success("Aggiunto!")
                     st.rerun()
 
@@ -950,6 +1300,41 @@ def admin_storico():
 # ─────────────────────────────────────────────
 def admin_impostazioni():
     st.subheader("🔧 Impostazioni")
+
+    st.markdown("#### Impostazioni globali")
+    st.caption("Si applicano a tutto il configuratore: IVA, importo minimo di lavorazione, contatti di consegna.")
+    imp = db.get_impostazioni_globali()
+    with st.form("impostazioni_globali"):
+        c1, c2 = st.columns(2)
+        iva = c1.number_input("IVA (%)", min_value=0.0, max_value=100.0,
+                               value=float(imp.get('iva', 22) or 0), step=1.0)
+        c2.caption("Mostrata come nota nel riepilogo finale del preventivo.")
+
+        c3, c4 = st.columns(2)
+        min_pub = c3.number_input("Minimo di lavorazione — Pubblico (€)", min_value=0.0,
+                                   value=float(imp.get('minimo_lavorazione_pub', 0) or 0), step=1.0)
+        min_rev = c4.number_input("Minimo di lavorazione — Rivenditore (€)", min_value=0.0,
+                                   value=float(imp.get('minimo_lavorazione_rev', 0) or 0), step=1.0)
+        st.caption("Se il totale del preventivo è sotto questa soglia, il cliente vede un avviso nel riepilogo.")
+
+        consegna_testo = st.text_input("Testo consegna stimata", value=imp.get('consegna_testo', ''),
+                                        placeholder="Es. 3–5 giorni lavorativi")
+        c5, c6 = st.columns(2)
+        consegna_email = c5.text_input("Email di contatto", value=imp.get('consegna_email', ''))
+        consegna_whatsapp = c6.text_input("WhatsApp (numero)", value=imp.get('consegna_whatsapp', ''))
+
+        if st.form_submit_button("💾 Salva impostazioni globali", type="primary"):
+            db.set_impostazione_globale('iva', iva)
+            db.set_impostazione_globale('minimo_lavorazione_pub', min_pub)
+            db.set_impostazione_globale('minimo_lavorazione_rev', min_rev)
+            db.set_impostazione_globale('consegna_testo', consegna_testo)
+            db.set_impostazione_globale('consegna_email', consegna_email)
+            db.set_impostazione_globale('consegna_whatsapp', consegna_whatsapp)
+            db.log("Aggiornate impostazioni globali", "save")
+            st.success("Impostazioni salvate!")
+            st.rerun()
+
+    st.divider()
     st.markdown("#### Cambia password amministratore")
     with st.form("change_pw"):
         pw_attuale = st.text_input("Password attuale", type="password")
@@ -985,21 +1370,22 @@ def page_configuratore():
     </div>
     """, unsafe_allow_html=True)
 
-    step = st.session_state.cfg_step
+    passi = pipeline_corrente()
+    step_key = step_key_corrente()
+    idx_corrente = passi.index(step_key)
 
-    # Breadcrumb testuale
-    passi = ["Categoria", "Materiale", "Colore", "Spessore", "Stampa", "Bianco", "Tipologia", "Dimensioni", "Quantità"]
+    # Breadcrumb testuale, costruito dai passi effettivamente applicabili
     bc = " › ".join(
-        f"**{p}**" if i + 1 == step else (f"~~{p}~~" if i + 1 < step else p)
+        f"**{PASSI_LABEL[p]}**" if i == idx_corrente else (f"~~{PASSI_LABEL[p]}~~" if i < idx_corrente else PASSI_LABEL[p])
         for i, p in enumerate(passi)
     )
     st.markdown(f"<small>{bc}</small>", unsafe_allow_html=True)
-    st.progress((step - 1) / (len(passi) - 1))
+    st.progress(idx_corrente / max(len(passi) - 1, 1))
     st.divider()
 
-    # ── STEP 1: Categoria ─────────────────────────────────────
-    if step == 1:
-        st.markdown("### Passo 1 — Scegli la categoria")
+    # ── STEP: Categoria ────────────────────────────────────────
+    if step_key == 'categoria':
+        st.markdown("### Scegli la categoria")
         categorie = db.get_categorie()
         if not categorie:
             st.warning("⚠️ Nessuna categoria disponibile. Configura il sistema dall'Admin.")
@@ -1014,13 +1400,12 @@ def page_configuratore():
                     st.session_state.cfg_mat_id = None
                     st.session_state.cfg_col_id = None
                     st.session_state.cfg_prod = None
-                    st.session_state.cfg_step = 2
-                    st.rerun()
+                    step_successivo()
 
-    # ── STEP 2: Materiale ─────────────────────────────────────
-    elif step == 2:
+    # ── STEP: Materiale ────────────────────────────────────────
+    elif step_key == 'materiale':
         cat = next((c for c in db.get_categorie(solo_attive=False) if c['id'] == st.session_state.cfg_cat_id), {})
-        st.markdown(f"### Passo 2 — Scegli il materiale")
+        st.markdown("### Scegli il materiale")
         st.caption(f"Categoria selezionata: **{cat.get('nome', '?')}**")
 
         materiali = db.get_materiali(cat_id=st.session_state.cfg_cat_id)
@@ -1036,14 +1421,14 @@ def page_configuratore():
                         st.session_state.cfg_mat_id = mat['id']
                         st.session_state.cfg_col_id = None
                         st.session_state.cfg_prod = None
-                        st.session_state.cfg_step = 3
-                        st.rerun()
-        st.button("← Indietro", on_click=lambda: setattr(st.session_state, 'cfg_step', 1))
+                        step_successivo()
+        if st.button("← Indietro", key="mat_indietro"):
+            step_precedente()
 
-    # ── STEP 3: Colore ────────────────────────────────────────
-    elif step == 3:
+    # ── STEP: Colore ───────────────────────────────────────────
+    elif step_key == 'colore':
         mat = next((m for m in db.get_materiali(solo_attivi=False) if m['id'] == st.session_state.cfg_mat_id), {})
-        st.markdown("### Passo 3 — Scegli il colore")
+        st.markdown("### Scegli il colore")
         st.caption(f"Materiale selezionato: **{mat.get('nome', '?')}**")
 
         colori = db.get_colori(mat_id=st.session_state.cfg_mat_id)
@@ -1058,16 +1443,14 @@ def page_configuratore():
                                  type="primary" if st.session_state.cfg_col_id == col['id'] else "secondary"):
                         st.session_state.cfg_col_id = col['id']
                         st.session_state.cfg_prod = None
-                        st.session_state.cfg_step = 4
-                        st.rerun()
-        if st.button("← Indietro"):
-            st.session_state.cfg_step = 2
-            st.rerun()
+                        step_successivo()
+        if st.button("← Indietro", key="col_indietro"):
+            step_precedente()
 
-    # ── STEP 4: Spessore ──────────────────────────────────────
-    elif step == 4:
+    # ── STEP: Spessore ─────────────────────────────────────────
+    elif step_key == 'spessore':
         col_info = next((c for c in db.get_colori(solo_attivi=False) if c['id'] == st.session_state.cfg_col_id), {})
-        st.markdown("### Passo 4 — Scegli lo spessore")
+        st.markdown("### Scegli lo spessore")
         st.caption(f"Colore selezionato: **{col_info.get('nome', '?')}**")
 
         prodotti = db.get_prodotti(colore_id=st.session_state.cfg_col_id)
@@ -1088,31 +1471,22 @@ def page_configuratore():
                         st.session_state.cfg_stampa_id = None
                         st.session_state.cfg_bianco_id = None
                         st.session_state.cfg_tipologia_id = None
-                        # Decide prossimo step
-                        if prod['supporta_stampa'] and prod['stampa_ids']:
-                            st.session_state.cfg_step = 5
-                        else:
-                            st.session_state.cfg_step = 8
-                        st.rerun()
-        if st.button("← Indietro"):
-            st.session_state.cfg_step = 3
-            st.rerun()
+                        st.session_state.cfg_cnc_ids = []
+                        st.session_state.cfg_finitura_ids = []
+                        st.session_state.cfg_optional_ids = []
+                        step_successivo()
+        if st.button("← Indietro", key="spe_indietro"):
+            step_precedente()
 
-    # ── STEP 5: Stampa ────────────────────────────────────────
-    elif step == 5:
+    # ── STEP: Stampa ───────────────────────────────────────────
+    elif step_key == 'stampa':
         prod = st.session_state.cfg_prod
-        st.markdown("### Passo 5 — Tipo di stampa")
+        st.markdown("### Tipo di stampa")
         st.caption(f"Prodotto: **{prod['spessore']}**")
 
         all_stampa = db.get_stampa()
-        stampa_ids = prod.get('stampa_ids', [])
-        disponibili = [s for s in all_stampa if s['id'] in stampa_ids]
+        disponibili = [s for s in all_stampa if s['id'] in prod.get('stampa_ids', [])]
         is_rev = st.session_state.cfg_is_rev
-
-        if not disponibili:
-            st.info("Nessuna opzione stampa — passo saltato")
-            st.session_state.cfg_step = 8
-            st.rerun()
 
         for s in disponibili:
             add = s['add_mq_rev'] if is_rev else s['add_mq_pub']
@@ -1120,38 +1494,19 @@ def page_configuratore():
             if st.button(f"🖨️  **{s['nome']}**  —  {add_str}",
                          key=f"st_{s['id']}", use_container_width=True):
                 st.session_state.cfg_stampa_id = s['id']
-                # Prossimo step
-                bianco_ids = prod.get('bianco_ids', [])
-                tipol_ids  = prod.get('tipologia_ids', [])
-                all_b = db.get_stampa_bianco()
-                bianco_d = [b for b in all_b if b['id'] in bianco_ids]
-                if bianco_d and not s.get('noprint'):
-                    st.session_state.cfg_step = 6
-                elif tipol_ids:
-                    st.session_state.cfg_step = 7
-                else:
-                    st.session_state.cfg_step = 8
-                st.rerun()
+                step_successivo()
 
-        if st.button("← Indietro"):
-            st.session_state.cfg_step = 4
-            st.rerun()
+        if st.button("← Indietro", key="stampa_indietro"):
+            step_precedente()
 
-    # ── STEP 6: Stampa Bianco ─────────────────────────────────
-    elif step == 6:
+    # ── STEP: Stampa Bianco ────────────────────────────────────
+    elif step_key == 'bianco':
         prod = st.session_state.cfg_prod
-        st.markdown("### Passo 6 — Stampa bianco")
+        st.markdown("### Stampa bianco")
 
         all_b = db.get_stampa_bianco()
-        bianco_ids = prod.get('bianco_ids', [])
-        disponibili = [b for b in all_b if b['id'] in bianco_ids]
+        disponibili = [b for b in all_b if b['id'] in prod.get('bianco_ids', [])]
         is_rev = st.session_state.cfg_is_rev
-
-        if not disponibili:
-            st.session_state.cfg_bianco_id = None
-            tipol_ids = prod.get('tipologia_ids', [])
-            st.session_state.cfg_step = 7 if tipol_ids else 8
-            st.rerun()
 
         for b in disponibili:
             add = b['add_mq_rev'] if is_rev else b['add_mq_pub']
@@ -1159,28 +1514,19 @@ def page_configuratore():
             if st.button(f"⬜  **{b['nome']}**  —  {add_str}",
                          key=f"bn_{b['id']}", use_container_width=True):
                 st.session_state.cfg_bianco_id = b['id']
-                tipol_ids = prod.get('tipologia_ids', [])
-                st.session_state.cfg_step = 7 if tipol_ids else 8
-                st.rerun()
+                step_successivo()
 
-        if st.button("← Indietro"):
-            st.session_state.cfg_step = 5
-            st.rerun()
+        if st.button("← Indietro", key="bianco_indietro"):
+            step_precedente()
 
-    # ── STEP 7: Tipologia Stampa ──────────────────────────────
-    elif step == 7:
+    # ── STEP: Tipologia Stampa ─────────────────────────────────
+    elif step_key == 'tipologia':
         prod = st.session_state.cfg_prod
-        st.markdown("### Passo 7 — Tipologia di stampa")
+        st.markdown("### Tipologia di stampa")
 
         all_t = db.get_tipologia_stampa()
-        tipol_ids = prod.get('tipologia_ids', [])
-        disponibili = [t for t in all_t if t['id'] in tipol_ids]
+        disponibili = [t for t in all_t if t['id'] in prod.get('tipologia_ids', [])]
         is_rev = st.session_state.cfg_is_rev
-
-        if not disponibili:
-            st.session_state.cfg_tipologia_id = None
-            st.session_state.cfg_step = 8
-            st.rerun()
 
         for t in disponibili:
             add = t['add_mq_rev'] if is_rev else t['add_mq_pub']
@@ -1188,17 +1534,103 @@ def page_configuratore():
             if st.button(f"🖼️  **{t['nome']}**  —  {add_str}",
                          key=f"tp_{t['id']}", use_container_width=True):
                 st.session_state.cfg_tipologia_id = t['id']
-                st.session_state.cfg_step = 8
-                st.rerun()
+                step_successivo()
 
-        prev_step = 6 if prod.get('bianco_ids') else 5
-        if st.button("← Indietro"):
-            st.session_state.cfg_step = prev_step
-            st.rerun()
+        if st.button("← Indietro", key="tipologia_indietro"):
+            step_precedente()
 
-    # ── STEP 8: Dimensioni ────────────────────────────────────
-    elif step == 8:
-        st.markdown("### Passo 8 — Dimensioni del supporto")
+    # ── STEP: CNC / Taglio (selezione multipla) ────────────────
+    elif step_key == 'cnc':
+        prod = st.session_state.cfg_prod
+        st.markdown("### CNC / Lavorazioni di taglio")
+        st.caption("Puoi selezionare più lavorazioni insieme.")
+
+        all_cnc = db.get_cnc()
+        disponibili = [c for c in all_cnc if c['id'] in prod.get('cnc_ids', [])]
+        is_rev = st.session_state.cfg_is_rev
+        selezionati = list(st.session_state.cfg_cnc_ids)
+
+        for c in disponibili:
+            if c['tipo_prezzo'] == 'mq':
+                val = c['prezzo_mq_rev'] if is_rev else c['prezzo_mq_pub']
+                prezzo_str = f"€ {val:.2f}/m²" if val > 0 else "incluso"
+            else:
+                val = c['prezzo_fisso_rev'] if is_rev else c['prezzo_fisso_pub']
+                prezzo_str = f"€ {val:.2f}" if val > 0 else "incluso"
+            etichetta = f"✂️ **{c['nome']}** — {prezzo_str}" + (f"  \n_{c['descrizione']}_" if c.get('descrizione') else "")
+            checked = st.checkbox(etichetta, value=c['id'] in selezionati, key=f"cnc_chk_{c['id']}")
+            if checked and c['id'] not in selezionati:
+                selezionati.append(c['id'])
+            elif not checked and c['id'] in selezionati:
+                selezionati.remove(c['id'])
+        st.session_state.cfg_cnc_ids = selezionati
+
+        col_n, col_a = st.columns(2)
+        if col_n.button("← Indietro", key="cnc_indietro"):
+            step_precedente()
+        if col_a.button("Avanti →", type="primary", key="cnc_avanti"):
+            step_successivo()
+
+    # ── STEP: Finitura superficiale (selezione multipla) ───────
+    elif step_key == 'finitura':
+        prod = st.session_state.cfg_prod
+        st.markdown("### Finitura superficiale")
+        st.caption("Percentuale calcolata sul subtotale materiale + stampa + CNC. Puoi selezionare più finiture.")
+
+        all_fin = db.get_finiture()
+        disponibili = [f for f in all_fin if f['id'] in prod.get('finitura_ids', [])]
+        is_rev = st.session_state.cfg_is_rev
+        selezionati = list(st.session_state.cfg_finitura_ids)
+
+        for f in disponibili:
+            perc = f['valore_rev'] if is_rev else f['valore_pub']
+            perc_str = f"+{perc:.1f}%" if perc > 0 else "incluso"
+            etichetta = f"✨ **{f['nome']}** — {perc_str}" + (f"  \n_{f['descrizione']}_" if f.get('descrizione') else "")
+            checked = st.checkbox(etichetta, value=f['id'] in selezionati, key=f"fin_chk_{f['id']}")
+            if checked and f['id'] not in selezionati:
+                selezionati.append(f['id'])
+            elif not checked and f['id'] in selezionati:
+                selezionati.remove(f['id'])
+        st.session_state.cfg_finitura_ids = selezionati
+
+        col_n, col_a = st.columns(2)
+        if col_n.button("← Indietro", key="finitura_indietro"):
+            step_precedente()
+        if col_a.button("Avanti →", type="primary", key="finitura_avanti"):
+            step_successivo()
+
+    # ── STEP: Optional e accessori (selezione multipla) ────────
+    elif step_key == 'optional':
+        prod = st.session_state.cfg_prod
+        st.markdown("### Optional e accessori")
+        st.caption("Prezzo fisso, al m², o al metro lineare di perimetro a seconda dell'accessorio. Puoi selezionarne più di uno.")
+
+        all_opt = db.get_optional()
+        disponibili = [o for o in all_opt if o['id'] in prod.get('optional_ids', [])]
+        is_rev = st.session_state.cfg_is_rev
+        selezionati = list(st.session_state.cfg_optional_ids)
+
+        unita_label = {'fisso': '', 'mq': '/m²', 'ml': '/ml (perimetro)'}
+        for o in disponibili:
+            val = o['valore_rev'] if is_rev else o['valore_pub']
+            prezzo_str = f"€ {val:.2f}{unita_label.get(o['tipo_prezzo'], '')}" if val > 0 else "incluso"
+            etichetta = f"➕ **{o['nome']}** — {prezzo_str}" + (f"  \n_{o['descrizione']}_" if o.get('descrizione') else "")
+            checked = st.checkbox(etichetta, value=o['id'] in selezionati, key=f"opt_chk_{o['id']}")
+            if checked and o['id'] not in selezionati:
+                selezionati.append(o['id'])
+            elif not checked and o['id'] in selezionati:
+                selezionati.remove(o['id'])
+        st.session_state.cfg_optional_ids = selezionati
+
+        col_n, col_a = st.columns(2)
+        if col_n.button("← Indietro", key="optional_indietro"):
+            step_precedente()
+        if col_a.button("Avanti →", type="primary", key="optional_avanti"):
+            step_successivo()
+
+    # ── STEP: Dimensioni ────────────────────────────────────────
+    elif step_key == 'dimensioni':
+        st.markdown("### Dimensioni del supporto")
         col1, col2, col3 = st.columns(3)
         with col1:
             larg = st.number_input("Larghezza (cm)", min_value=1.0, max_value=10000.0,
@@ -1214,29 +1646,17 @@ def page_configuratore():
 
         p = calcola_prezzo_dati()
         if p:
-            st.info(f"€/m²: **{p['prezzo_mq']:.2f}** → Prezzo pezzo: **€ {p['prezzo_pezzo']:.2f}**")
+            st.info(f"€/m²: **{p['prezzo_mq']:.2f}** → Prezzo pezzo (con lavorazioni scelte): **€ {p['prezzo_pezzo']:.2f}**")
 
         col_n, col_a = st.columns(2)
-        if col_n.button("← Indietro"):
-            prod = st.session_state.cfg_prod
-            tipol_ids = prod.get('tipologia_ids', []) if prod else []
-            bianco_ids = prod.get('bianco_ids', []) if prod else []
-            if tipol_ids:
-                st.session_state.cfg_step = 7
-            elif bianco_ids:
-                st.session_state.cfg_step = 6
-            elif prod and prod.get('stampa_ids'):
-                st.session_state.cfg_step = 5
-            else:
-                st.session_state.cfg_step = 4
-            st.rerun()
-        if col_a.button("Avanti →", type="primary"):
-            st.session_state.cfg_step = 9
-            st.rerun()
+        if col_n.button("← Indietro", key="dim_indietro"):
+            step_precedente()
+        if col_a.button("Avanti →", type="primary", key="dim_avanti"):
+            step_successivo()
 
-    # ── STEP 9: Quantità e Riepilogo ─────────────────────────
-    elif step == 9:
-        st.markdown("### Passo 9 — Quantità e Riepilogo finale")
+    # ── STEP: Quantità e Riepilogo ──────────────────────────────
+    elif step_key == 'quantita':
+        st.markdown("### Quantità e Riepilogo finale")
 
         qty = st.number_input("Numero di pezzi", min_value=1, max_value=99999,
                               value=st.session_state.cfg_qty, step=1)
@@ -1251,6 +1671,16 @@ def page_configuratore():
             c1.metric("€ / m²",  f"€ {p['prezzo_mq']:.2f}")
             c2.metric("€ / pezzo", f"€ {p['prezzo_pezzo']:.2f}")
             c3.metric(f"TOTALE ({qty} pz)", f"€ {p['prezzo_tot']:.2f}")
+
+            minimo = db.get_impostazione_globale(
+                'minimo_lavorazione_rev' if is_rev else 'minimo_lavorazione_pub', '0')
+            try:
+                minimo_val = float(minimo)
+            except ValueError:
+                minimo_val = 0.0
+            if minimo_val > 0 and p['prezzo_tot'] < minimo_val:
+                st.markdown(f'<span class="badge-warn">⚠️ Sotto il minimo di lavorazione (€ {minimo_val:.2f}) — '
+                            f'verrà applicato il minimo in fase di conferma ordine</span>', unsafe_allow_html=True)
 
         # Riepilogo configurazione
         st.divider()
@@ -1289,8 +1719,21 @@ def page_configuratore():
             tipo = next((t for t in db.get_tipologia_stampa() if t['id'] == st.session_state.cfg_tipologia_id), {})
             dati["Tipologia"] = tipo.get('nome', '—')
 
+        if p and p['dettaglio_cnc']:
+            dati["CNC/Taglio"] = ", ".join(d['nome'] for d in p['dettaglio_cnc'])
+        if p and p['dettaglio_finitura']:
+            dati["Finitura"] = ", ".join(d['nome'] for d in p['dettaglio_finitura'])
+        if p and p['dettaglio_optional']:
+            dati["Optional"] = ", ".join(d['nome'] for d in p['dettaglio_optional'])
+
         if p:
-            dati["€/m²"] = f"€ {p['prezzo_mq']:.2f}"
+            dati["€/m² base"] = f"€ {p['prezzo_mq']:.2f}"
+            if p['costo_cnc'] > 0:
+                dati["+ CNC/Taglio"] = f"€ {p['costo_cnc']:.2f}"
+            if p['costo_finitura'] > 0:
+                dati["+ Finitura"] = f"€ {p['costo_finitura']:.2f}"
+            if p['costo_optional'] > 0:
+                dati["+ Optional"] = f"€ {p['costo_optional']:.2f}"
             dati["Prezzo / pezzo"] = f"€ {p['prezzo_pezzo']:.2f}"
             dati["**TOTALE**"] = f"**€ {p['prezzo_tot']:.2f}**"
 
@@ -1299,15 +1742,25 @@ def page_configuratore():
             col_k.markdown(f"*{k}*")
             col_v.markdown(v)
 
+        iva = db.get_impostazione_globale('iva', '0')
+        try:
+            iva_val = float(iva)
+        except ValueError:
+            iva_val = 0.0
+        if iva_val > 0 and p:
+            st.caption(f"IVA ({iva_val:.0f}%) esclusa — totale con IVA: € {p['prezzo_tot'] * (1 + iva_val/100):.2f}")
+
+        consegna = db.get_impostazione_globale('consegna_testo', '')
+        if consegna:
+            st.caption(f"🚚 Consegna stimata: {consegna}")
+
         st.divider()
         c1, c2 = st.columns(2)
-        if c1.button("← Modifica dimensioni"):
-            st.session_state.cfg_step = 8
-            st.rerun()
-        if c2.button("🔄 Nuovo preventivo", type="primary"):
+        if c1.button("← Modifica", key="quantita_indietro"):
+            step_precedente()
+        if c2.button("🔄 Nuovo preventivo", type="primary", key="quantita_reset"):
             cfg_reset()
             st.rerun()
-
 
 # ══════════════════════════════════════════════════════════════
 # ROUTING PRINCIPALE
